@@ -13,7 +13,7 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
@@ -121,14 +121,20 @@ if hasattr(os, "register_at_fork"):
 
 
 class Upsert(BaseModel):
-    """One task for ``PQ.upsert_many``; the fields are ``upsert()``'s arguments."""
+    """One task for ``PQ.upsert_many``; the fields are ``upsert()``'s arguments.
 
-    model_config = ConfigDict(frozen=True)
+    ``args`` and ``kwargs`` are fields here, where ``upsert()`` takes
+    ``*args`` and ``**kwargs``. Strict: values are not coerced, so
+    ``args`` must be a tuple and ``priority`` a ``Priority``.
+    """
 
-    task: Callable[..., Any]
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    task: Callable[..., object]
     client_id: str
-    args: tuple[Any, ...] = ()
-    kwargs: dict[str, Any] = {}
+    # Kept out of ``repr`` so task arguments (tokens, PII) don't reach logs.
+    args: tuple[object, ...] = Field(default=(), repr=False)
+    kwargs: dict[str, object] = Field(default={}, repr=False)
     run_at: datetime | None = None
     priority: Priority = Priority.NORMAL
     max_runtime_seconds: float | None = None
@@ -187,7 +193,7 @@ def _upsert_statement(
         # ``CASE`` would bind ``'pending'`` and fail.
         return sa.case((running, column), else_=sa.literal(value, column.type))
 
-    stmt = (
+    return (
         insert(Task)
         .values(
             client_id=client_id,
@@ -218,7 +224,6 @@ def _upsert_statement(
         )
         .returning(Task.id)
     )
-    return stmt
 
 
 class PQ:
@@ -435,10 +440,11 @@ class PQ:
     def upsert_many(self, upserts: Sequence[Upsert]) -> list[int]:
         """Upsert several tasks in one transaction.
 
-        Each item behaves exactly like ``upsert()`` with the same arguments,
-        applied in order, so a repeated ``client_id`` ends with its last
-        version. One session and one commit for the batch, against one each
-        per ``upsert()`` call. Nothing is written if any item fails.
+        Each item behaves like ``upsert()`` with the same arguments, so a
+        RUNNING row gets the new version parked. A repeated ``client_id``
+        ends with its last version. One session and one commit for the
+        batch, against one each per ``upsert()`` call. Nothing is written
+        if any item fails.
 
         Returns:
             Task IDs, in the order of ``upserts``.
