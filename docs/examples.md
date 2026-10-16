@@ -185,6 +185,22 @@ with PQ(DATABASE_URL) as pq:
 
 If the worker dies while the run is in progress, the stale-task reaper re-queues the row with the waiting version instead of marking it failed. Until then (`stale_task_timeout`, default 1 hour) the waiting version does not run, and with the reaper disabled (`stale_task_timeout=None`) it never runs. Keep `stale_task_timeout` longer than your longest run: if the reaper picks up a run that is still alive, the waiting version can start next to it.
 
+
+### Many at once
+
+`upsert_many()` takes a list of `Upsert` items and applies each one as `upsert()` would, in order, in one transaction. Use it for a batch: it opens one session and commits once, where a loop of `upsert()` calls commits once per task. If any item is invalid, nothing is written.
+
+```python
+from pq import PQ, Upsert
+
+task_ids = pq.upsert_many(
+    [
+        Upsert(task=send_notification, kwargs={"user_id": uid, "message": "Hi"}, client_id=f"notify-{uid}")
+        for uid in user_ids
+    ]
+)
+```
+
 ## Worker Lifecycle Hooks
 
 Use `pre_execute` and `post_execute` hooks to run code before/after task execution. Hooks run in the forked child process, making them ideal for fork-unsafe resources like OpenTelemetry.

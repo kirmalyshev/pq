@@ -5,7 +5,7 @@ from croniter import croniter
 from datetime import UTC, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 
-from pq.client import PQ
+from pq.client import PQ, Upsert
 from pq.models import Periodic, Task
 
 
@@ -699,6 +699,70 @@ def _mark_running(pq: PQ, task_id: int, started_at: datetime | None = None) -> N
                 attempts=1,
             )
         )
+
+
+class TestUpsertMany:
+    """``upsert_many`` applies each item as ``upsert`` would, in one transaction."""
+
+    def test_upsert_many_creates_tasks_in_order(self, pq: PQ) -> None:
+        ids = pq.upsert_many(
+            [
+                Upsert(task=upsert_handler, kwargs={"value": i}, client_id=f"t-{i}")
+                for i in range(3)
+            ]
+        )
+
+        assert len(ids) == 3
+        for i, task_id in enumerate(ids):
+            task = pq.get_task_by_client_id(f"t-{i}")
+            assert task is not None
+            assert task.id == task_id
+            assert task.payload["kwargs"] == {"value": i}
+        assert pq.pending_count() == 3
+
+    def test_upsert_many_repeated_client_id_keeps_last_version(self, pq: PQ) -> None:
+        first, second = pq.upsert_many(
+            [
+                Upsert(task=upsert_handler, kwargs={"value": 1}, client_id="same"),
+                Upsert(task=upsert_handler, kwargs={"value": 2}, client_id="same"),
+            ]
+        )
+
+        assert first == second
+        task = pq.get_task_by_client_id("same")
+        assert task is not None
+        assert task.payload["kwargs"] == {"value": 2}
+        assert pq.pending_count() == 1
+
+    def test_upsert_many_parks_version_of_running_row(self, pq: PQ) -> None:
+        from pq.models import TaskStatus
+
+        task_id = pq.upsert(upsert_handler, value=1, client_id="running")
+        _mark_running(pq, task_id)
+
+        pq.upsert_many(
+            [Upsert(task=upsert_handler, kwargs={"value": 2}, client_id="running")]
+        )
+
+        task = pq.get_task(task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert task.payload["kwargs"] == {"value": 1}
+        assert task.requeue is not None
+
+    def test_upsert_many_invalid_item_writes_nothing(self, pq: PQ) -> None:
+        with pytest.raises(ValueError):
+            pq.upsert_many(
+                [
+                    Upsert(task=upsert_handler, client_id="ok"),
+                    Upsert(task=lambda: None, client_id="lambda"),
+                ]
+            )
+
+        assert pq.get_task_by_client_id("ok") is None
+
+    def test_upsert_many_empty_returns_empty(self, pq: PQ) -> None:
+        assert pq.upsert_many([]) == []
 
 
 class TestUpsertWhileRunning:

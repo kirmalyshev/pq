@@ -4,7 +4,7 @@ import importlib.resources
 import math
 import os
 import weakref
-from collections.abc import Callable, Set
+from collections.abc import Callable, Sequence, Set
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -13,6 +13,7 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
@@ -117,6 +118,107 @@ def _dispose_pools(*, close: bool, failure: str) -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_pools_after_fork)
+
+
+class Upsert(BaseModel):
+    """One task for ``PQ.upsert_many``; the fields are ``upsert()``'s arguments."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task: Callable[..., Any]
+    client_id: str
+    args: tuple[Any, ...] = ()
+    kwargs: dict[str, Any] = {}
+    run_at: datetime | None = None
+    priority: Priority = Priority.NORMAL
+    max_runtime_seconds: float | None = None
+
+
+def _upsert_statement(
+    task: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    run_at: datetime | None,
+    priority: Priority,
+    client_id: str,
+    max_runtime_seconds: float | None,
+) -> sa.Insert:
+    """The ``INSERT ... ON CONFLICT DO UPDATE`` behind ``PQ.upsert``."""
+    _validate_max_runtime(max_runtime_seconds)
+    name = get_function_path(task)
+    payload = serialize(args, kwargs)
+
+    if run_at is None:
+        run_at = datetime.now(UTC)
+
+    # In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` refers to the
+    # existing row. A RUNNING row keeps every column as it is (the run
+    # in progress keeps its payload, ``started_at``, ``attempts`` and
+    # ``max_runtime_seconds``); the new version is parked in
+    # ``requeue`` and applied when the run ends. Any other status gets
+    # the plain overwrite. All in one statement, so the decision is
+    # made under the row lock that ``ON CONFLICT`` takes.
+    running = Task.status == TaskStatus.RUNNING
+    # ``run_at`` is added in SQL as ``timestamptz``, so Postgres
+    # serializes it as ISO 8601 with an offset. A naive ``run_at`` is
+    # then read in this session's time zone, the same as on the direct
+    # path, and not later in the session of whoever applies the version.
+    requeue = sa.literal(
+        {
+            "name": name,
+            "payload": payload,
+            "priority": int(priority),
+            "max_runtime_seconds": max_runtime_seconds,
+        },
+        JSONB,
+    ).op("||", return_type=JSONB)(
+        sa.func.jsonb_build_object(
+            "run_at", sa.cast(sa.literal(run_at), sa.DateTime(timezone=True))
+        )
+    )
+
+    def unless_running[T](
+        value: T, column: InstrumentedAttribute[T]
+    ) -> sa.ColumnElement[T]:
+        # ``sa.literal(..., column.type)`` binds the value through the
+        # column's type. Required for the ``task_status`` enum, which
+        # stores member names (``'PENDING'``): a bare enum member in a
+        # ``CASE`` would bind ``'pending'`` and fail.
+        return sa.case((running, column), else_=sa.literal(value, column.type))
+
+    stmt = (
+        insert(Task)
+        .values(
+            client_id=client_id,
+            name=name,
+            payload=payload,
+            priority=priority,
+            status=TaskStatus.PENDING,
+            run_at=run_at,
+            max_runtime_seconds=max_runtime_seconds,
+        )
+        .on_conflict_do_update(
+            index_elements=["client_id"],
+            set_={
+                "name": unless_running(name, Task.name),
+                "payload": unless_running(payload, Task.payload),
+                "priority": unless_running(int(priority), Task.priority),
+                "status": unless_running(TaskStatus.PENDING, Task.status),
+                "run_at": unless_running(run_at, Task.run_at),
+                "max_runtime_seconds": unless_running(
+                    max_runtime_seconds, Task.max_runtime_seconds
+                ),
+                "attempts": unless_running(0, Task.attempts),
+                "started_at": unless_running(None, Task.started_at),
+                "completed_at": unless_running(None, Task.completed_at),
+                "error": unless_running(None, Task.error),
+                "requeue": sa.case((running, requeue), else_=sa.null()),
+            },
+        )
+        .returning(Task.id)
+    )
+    return stmt
 
 
 class PQ:
@@ -316,83 +418,48 @@ class PQ:
             ValueError: If task is a lambda, closure, or cannot be imported,
                 or if ``max_runtime_seconds`` is not None and ``<= 0``.
         """
-        _validate_max_runtime(max_runtime_seconds)
-        name = get_function_path(task)
-        payload = serialize(args, kwargs)
-
-        if run_at is None:
-            run_at = datetime.now(UTC)
-
-        # In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` refers to the
-        # existing row. A RUNNING row keeps every column as it is (the run
-        # in progress keeps its payload, ``started_at``, ``attempts`` and
-        # ``max_runtime_seconds``); the new version is parked in
-        # ``requeue`` and applied when the run ends. Any other status gets
-        # the plain overwrite. All in one statement, so the decision is
-        # made under the row lock that ``ON CONFLICT`` takes.
-        running = Task.status == TaskStatus.RUNNING
-        # ``run_at`` is added in SQL as ``timestamptz``, so Postgres
-        # serializes it as ISO 8601 with an offset. A naive ``run_at`` is
-        # then read in this session's time zone, the same as on the direct
-        # path, and not later in the session of whoever applies the version.
-        requeue = sa.literal(
-            {
-                "name": name,
-                "payload": payload,
-                "priority": int(priority),
-                "max_runtime_seconds": max_runtime_seconds,
-            },
-            JSONB,
-        ).op("||", return_type=JSONB)(
-            sa.func.jsonb_build_object(
-                "run_at", sa.cast(sa.literal(run_at), sa.DateTime(timezone=True))
-            )
-        )
-
-        def unless_running[T](
-            value: T, column: InstrumentedAttribute[T]
-        ) -> sa.ColumnElement[T]:
-            # ``sa.literal(..., column.type)`` binds the value through the
-            # column's type. Required for the ``task_status`` enum, which
-            # stores member names (``'PENDING'``): a bare enum member in a
-            # ``CASE`` would bind ``'pending'`` and fail.
-            return sa.case((running, column), else_=sa.literal(value, column.type))
-
-        stmt = (
-            insert(Task)
-            .values(
-                client_id=client_id,
-                name=name,
-                payload=payload,
-                priority=priority,
-                status=TaskStatus.PENDING,
-                run_at=run_at,
-                max_runtime_seconds=max_runtime_seconds,
-            )
-            .on_conflict_do_update(
-                index_elements=["client_id"],
-                set_={
-                    "name": unless_running(name, Task.name),
-                    "payload": unless_running(payload, Task.payload),
-                    "priority": unless_running(int(priority), Task.priority),
-                    "status": unless_running(TaskStatus.PENDING, Task.status),
-                    "run_at": unless_running(run_at, Task.run_at),
-                    "max_runtime_seconds": unless_running(
-                        max_runtime_seconds, Task.max_runtime_seconds
-                    ),
-                    "attempts": unless_running(0, Task.attempts),
-                    "started_at": unless_running(None, Task.started_at),
-                    "completed_at": unless_running(None, Task.completed_at),
-                    "error": unless_running(None, Task.error),
-                    "requeue": sa.case((running, requeue), else_=sa.null()),
-                },
-            )
-            .returning(Task.id)
+        stmt = _upsert_statement(
+            task,
+            args,
+            kwargs,
+            run_at=run_at,
+            priority=priority,
+            client_id=client_id,
+            max_runtime_seconds=max_runtime_seconds,
         )
 
         with self.session() as session:
             result = session.execute(stmt)
             return result.scalar_one()
+
+    def upsert_many(self, upserts: Sequence[Upsert]) -> list[int]:
+        """Upsert several tasks in one transaction.
+
+        Each item behaves exactly like ``upsert()`` with the same arguments,
+        applied in order, so a repeated ``client_id`` ends with its last
+        version. One session and one commit for the batch, against one each
+        per ``upsert()`` call. Nothing is written if any item fails.
+
+        Returns:
+            Task IDs, in the order of ``upserts``.
+
+        Raises:
+            ValueError: As ``upsert()``, for the first invalid item.
+        """
+        stmts = [
+            _upsert_statement(
+                u.task,
+                u.args,
+                u.kwargs,
+                run_at=u.run_at,
+                priority=u.priority,
+                client_id=u.client_id,
+                max_runtime_seconds=u.max_runtime_seconds,
+            )
+            for u in upserts
+        ]
+        with self.session() as session:
+            return [session.execute(stmt).scalar_one() for stmt in stmts]
 
     def schedule(
         self,
