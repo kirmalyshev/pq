@@ -1,12 +1,16 @@
 """Tests for PQ client."""
 
+from collections.abc import Callable
+
 import pytest
 from croniter import croniter
 from datetime import UTC, datetime, timedelta
 from sqlalchemy.exc import IntegrityError
 
 from pq.client import PQ, Upsert
-from pq.models import Periodic, Task
+from pq.models import Periodic, Task, TaskStatus
+from pq.priority import Priority
+from pq.serialization import serialize
 
 
 def dummy_handler(key: str = "") -> None:
@@ -728,9 +732,6 @@ class TestUpsertMany:
 
     def test_upsert_many_writes_every_field(self, pq: PQ) -> None:
         """Positional args, run_at, priority and max_runtime_seconds reach the row."""
-        from pq.priority import Priority
-        from pq.serialization import serialize
-
         run_at = datetime.now(UTC) + timedelta(hours=1)
         first, second = pq.upsert_many(
             [
@@ -778,9 +779,6 @@ class TestUpsertMany:
 
     def test_upsert_many_parks_version_of_running_row(self, pq: PQ) -> None:
         """A RUNNING row in a mixed batch is untouched and gets the version parked."""
-        from pq.models import TaskStatus
-        from pq.priority import Priority
-        from pq.serialization import serialize
 
         task_id = pq.upsert(
             upsert_handler, value=1, client_id="running", max_runtime_seconds=600.0
@@ -880,12 +878,32 @@ class TestUpsertMany:
         assert task.payload["kwargs"] == {"value": 0}
         assert pq.get_task_by_client_id("b") is None
 
-    def test_upsert_many_is_strict(self) -> None:
-        """No coercion: values ``upsert()`` would not get are rejected."""
-        from pydantic import ValidationError
+    @pytest.mark.parametrize(
+        ("task", "max_runtime_seconds"),
+        [(lambda: None, None), (upsert_handler, 0), (upsert_handler, -1.0)],
+    )
+    def test_upsert_many_rejects_what_upsert_rejects(
+        self,
+        pq: PQ,
+        task: Callable[..., object],
+        max_runtime_seconds: float | None,
+    ) -> None:
+        """Items are checked by ``upsert()``'s code: same error, same message."""
+        with pytest.raises(ValueError) as single:
+            pq.upsert(task, client_id="x", max_runtime_seconds=max_runtime_seconds)
+        with pytest.raises(ValueError) as many:
+            pq.upsert_many(
+                [
+                    Upsert(
+                        task=task,
+                        client_id="x",
+                        max_runtime_seconds=max_runtime_seconds,
+                    )
+                ]
+            )
 
-        with pytest.raises(ValidationError):
-            Upsert(task=upsert_handler, client_id="x", max_runtime_seconds="5")  # type: ignore[arg-type]
+        assert str(many.value) == str(single.value)
+        assert pq.get_task_by_client_id("x") is None
 
     def test_upsert_repr_hides_arguments(self) -> None:
         """``repr`` leaves out task arguments, which may hold secrets."""

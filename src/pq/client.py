@@ -6,6 +6,7 @@ import os
 import weakref
 from collections.abc import Callable, Sequence, Set
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import Any, Self
@@ -13,7 +14,6 @@ from typing import Any, Self
 from croniter import croniter
 from croniter.croniter import CroniterBadCronError
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
 import sqlalchemy as sa
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
@@ -120,43 +120,34 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_pools_after_fork)
 
 
-class Upsert(BaseModel):
+@dataclass(kw_only=True, slots=True)
+class Upsert:
     """One task for ``PQ.upsert_many``; the fields are ``upsert()``'s arguments.
 
     ``args`` and ``kwargs`` are fields here, where ``upsert()`` takes
-    ``*args`` and ``**kwargs``. Strict: values are not coerced, so
-    ``args`` must be a tuple and ``priority`` a ``Priority``.
+    ``*args`` and ``**kwargs``. The item is checked when it is upserted,
+    by the same code as ``upsert()``, so both accept the same values.
     """
-
-    model_config = ConfigDict(frozen=True, strict=True)
 
     task: Callable[..., object]
     client_id: str
     # Kept out of ``repr`` so task arguments (tokens, PII) don't reach logs.
-    args: tuple[object, ...] = Field(default=(), repr=False)
-    kwargs: dict[str, object] = Field(default={}, repr=False)
+    args: tuple[object, ...] = field(default=(), repr=False)
+    kwargs: dict[str, object] = field(default_factory=dict, repr=False)
     run_at: datetime | None = None
     priority: Priority = Priority.NORMAL
     max_runtime_seconds: float | None = None
 
 
-def _upsert_statement(
-    task: Callable[..., Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    *,
-    run_at: datetime | None,
-    priority: Priority,
-    client_id: str,
-    max_runtime_seconds: float | None,
-) -> sa.Insert:
+def _upsert_statement(u: Upsert) -> sa.Insert:
     """The ``INSERT ... ON CONFLICT DO UPDATE`` behind ``PQ.upsert``."""
-    _validate_max_runtime(max_runtime_seconds)
-    name = get_function_path(task)
-    payload = serialize(args, kwargs)
-
-    if run_at is None:
-        run_at = datetime.now(UTC)
+    _validate_max_runtime(u.max_runtime_seconds)
+    name = get_function_path(u.task)
+    payload = serialize(u.args, u.kwargs)
+    priority = u.priority
+    client_id = u.client_id
+    max_runtime_seconds = u.max_runtime_seconds
+    run_at = datetime.now(UTC) if u.run_at is None else u.run_at
 
     # In ``ON CONFLICT DO UPDATE``, ``Task.<column>`` refers to the
     # existing row. A RUNNING row keeps every column as it is (the run
@@ -424,13 +415,15 @@ class PQ:
                 or if ``max_runtime_seconds`` is not None and ``<= 0``.
         """
         stmt = _upsert_statement(
-            task,
-            args,
-            kwargs,
-            run_at=run_at,
-            priority=priority,
-            client_id=client_id,
-            max_runtime_seconds=max_runtime_seconds,
+            Upsert(
+                task=task,
+                client_id=client_id,
+                args=args,
+                kwargs=kwargs,
+                run_at=run_at,
+                priority=priority,
+                max_runtime_seconds=max_runtime_seconds,
+            )
         )
 
         with self.session() as session:
@@ -459,18 +452,7 @@ class PQ:
         Raises:
             ValueError: As ``upsert()``, for the first invalid item.
         """
-        stmts = [
-            _upsert_statement(
-                u.task,
-                u.args,
-                u.kwargs,
-                run_at=u.run_at,
-                priority=u.priority,
-                client_id=u.client_id,
-                max_runtime_seconds=u.max_runtime_seconds,
-            )
-            for u in upserts
-        ]
+        stmts = [_upsert_statement(u) for u in upserts]
         order = sorted(range(len(upserts)), key=lambda i: upserts[i].client_id)
         ids = [0] * len(upserts)
         with self.session() as session:
