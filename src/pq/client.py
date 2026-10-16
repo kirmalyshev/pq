@@ -446,6 +446,13 @@ class PQ:
         batch, against one each per ``upsert()`` call. Nothing is written
         if any item fails.
 
+        The items are written in ``client_id`` order (stable, so repeated
+        ids keep input order), so that two batches with overlapping ids
+        lock rows in the same order and cannot deadlock. Each row stays
+        locked until the batch commits: a worker finishing one of these
+        tasks waits for the whole batch. Split very large batches into
+        chunks to keep that wait short.
+
         Returns:
             Task IDs, in the order of ``upserts``.
 
@@ -464,8 +471,12 @@ class PQ:
             )
             for u in upserts
         ]
+        order = sorted(range(len(upserts)), key=lambda i: upserts[i].client_id)
+        ids = [0] * len(upserts)
         with self.session() as session:
-            return [session.execute(stmt).scalar_one() for stmt in stmts]
+            for i in order:
+                ids[i] = session.execute(stmts[i]).scalar_one()
+        return ids
 
     def schedule(
         self,

@@ -898,6 +898,42 @@ class TestUpsertMany:
 
         assert "s3cr3t" not in repr(item)
 
+    def test_concurrent_batches_in_opposite_orders_do_not_deadlock(
+        self, pq: PQ
+    ) -> None:
+        """Two batches over the same rows, in opposite orders, both commit."""
+        import threading
+
+        keys = [f"k{i}" for i in range(1000)]
+        pq.upsert_many([Upsert(task=upsert_handler, client_id=k) for k in keys])
+        errors: list[Exception] = []
+        start = threading.Barrier(2)
+
+        def run(order: list[str], value: int) -> None:
+            start.wait()
+            try:
+                pq.upsert_many(
+                    [
+                        Upsert(
+                            task=upsert_handler, kwargs={"value": value}, client_id=k
+                        )
+                        for k in order
+                    ]
+                )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=run, args=(keys, 1)),
+            threading.Thread(target=run, args=(keys[::-1], 2)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+
     def test_upsert_many_empty_returns_empty(self, pq: PQ) -> None:
         """An empty batch writes nothing."""
         assert pq.upsert_many([]) == []
