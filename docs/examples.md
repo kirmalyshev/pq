@@ -208,7 +208,7 @@ with PQ("postgresql://localhost/mydb") as pq:
     )
 ```
 
-An `Upsert` has the same fields as the `upsert()` arguments: `task` and `client_id` are required, and `args` (a tuple), `kwargs` (a dict), `run_at`, `priority` (a `Priority`) and `max_runtime_seconds` are optional. Values are not coerced: a wrong type raises `ValidationError` when you create the item.
+An `Upsert` has the same fields as the `upsert()` arguments: `task` and `client_id` are required, and `args` (a tuple), `kwargs` (a dict), `run_at`, `priority` and `max_runtime_seconds` are optional. The item does no checks of its own: `upsert_many()` checks each item with the same code as `upsert()`, so both accept the same values and raise the same errors.
 
 - The returned IDs are in the order of the input list.
 - A repeated `client_id` ends with its last version, and its ID appears once per item.
